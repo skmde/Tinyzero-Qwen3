@@ -126,6 +126,16 @@
 - 单卡时 tensor_model_parallel_size 是否设置为 1。
 - 无 flash_attn 时是否已关闭 remove_padding 路径并启用 sdpa 回退。
 
+## 7. Python 3.12 + CUDA 12.8 双卡可行性
+
+- 可行，但建议按“兼容优先”方式运行：
+  - Python: 3.12
+  - CUDA Driver: 12.8
+  - PyTorch: 安装官方预编译 cu12x wheel（无需本地 CUDA toolkit 与驱动版本完全一致）
+- 本仓库已将本地调试脚本的 Python 版本检查放宽到 3.10-3.12。
+- 双卡脚本默认 `CUDA_VISIBLE_DEVICES=0,1`，并自动按该变量推导 `N_GPUS_PER_NODE`。
+- 不建议在该环境优先处理 flash-attn 本地编译；优先使用 `use_remove_padding=False` + `sdpa` 回退链路保证可跑通。
+
 ---
 
 本次改进目标是先确保链路可启动并可执行训练步骤，再逐步提升稳定性与吞吐。

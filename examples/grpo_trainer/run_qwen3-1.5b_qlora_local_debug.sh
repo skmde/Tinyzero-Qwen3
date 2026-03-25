@@ -32,7 +32,7 @@ fi
 
 echo "Using PYTHON_BIN=$PYTHON_BIN"
 
-"$PYTHON_BIN" -c "import sys; major, minor = sys.version_info[:2]; assert (major == 3 and minor <= 11), f'Python {major}.{minor} is not supported for TinyZero RL debug. Please use Python 3.10 or 3.11 because ray wheels are unavailable for this version.'" || exit 1
+"$PYTHON_BIN" -c "import sys; major, minor = sys.version_info[:2]; assert (major == 3 and 10 <= minor <= 12), f'Python {major}.{minor} is outside supported range for this script. Please use Python 3.10-3.12.'" || exit 1
 
 "$PYTHON_BIN" -c "import numpy, hydra, ray, transformers" || {
     echo "Missing dependencies in current Python env."

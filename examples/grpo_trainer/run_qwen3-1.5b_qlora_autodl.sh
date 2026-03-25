@@ -7,7 +7,7 @@ set -x
 #   MODEL_PATH=Qwen/Qwen3-1.5B-Instruct N_GPUS_PER_NODE=4 bash ...
 
 export VLLM_ATTENTION_BACKEND=${VLLM_ATTENTION_BACKEND:-XFORMERS}
-export CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-0,1,2,3}
+export CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-0,1}
 
 DEFAULT_MODEL_PATH=Qwen/Qwen3-1.5B
 if [ -d "./Qwen/Qwen3-1___7B-Base" ]; then
@@ -18,7 +18,10 @@ TRAIN_FILE=${TRAIN_FILE:-$HOME/data/gsm8k/train.parquet}
 VAL_FILE=${VAL_FILE:-$HOME/data/gsm8k/test.parquet}
 
 NNODES=${NNODES:-1}
-N_GPUS_PER_NODE=${N_GPUS_PER_NODE:-$(python3 -c "import os; print(len([x for x in os.environ.get('CUDA_VISIBLE_DEVICES', '').split(',') if x != '']))")}
+if [ -z "${N_GPUS_PER_NODE}" ]; then
+    IFS=',' read -r -a _gpu_ids <<< "$CUDA_VISIBLE_DEVICES"
+    N_GPUS_PER_NODE=${#_gpu_ids[@]}
+fi
 
 PROJECT_NAME=${PROJECT_NAME:-tinyzero_qwen3_1p5b}
 EXPERIMENT_NAME=${EXPERIMENT_NAME:-grpo_qlora_autodl}
