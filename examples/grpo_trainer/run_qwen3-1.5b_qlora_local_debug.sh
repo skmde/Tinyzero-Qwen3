@@ -79,6 +79,7 @@ fi
     actor_rollout_ref.actor.fsdp_config.grad_offload=False \
     actor_rollout_ref.actor.fsdp_config.optimizer_offload=False \
     actor_rollout_ref.rollout.name=hf \
+    actor_rollout_ref.rollout.tensor_model_parallel_size=1 \
     actor_rollout_ref.rollout.n=2 \
     actor_rollout_ref.rollout.log_prob_micro_batch_size=2 \
     actor_rollout_ref.ref.log_prob_micro_batch_size=2 \

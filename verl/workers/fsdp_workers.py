@@ -618,7 +618,7 @@ class CriticWorker(Worker):
         from transformers import AutoConfig, AutoModelForTokenClassification
         from torch import nn
 
-        trust_remote_code = False
+        trust_remote_code = config.model.get('trust_remote_code', False)
         critic_model_config = AutoConfig.from_pretrained(local_path, trust_remote_code=trust_remote_code)
         critic_model_config.num_labels = 1
 
@@ -631,6 +631,12 @@ class CriticWorker(Worker):
             from verl.models.transformers.monkey_patch import apply_monkey_patch
             apply_monkey_patch(critic_model_config, verbose=True)
 
+        attn_implementation = 'flash_attention_2'
+        try:
+            import flash_attn  # noqa: F401
+        except ImportError:
+            attn_implementation = 'sdpa'
+
         init_context = get_init_weight_context_manager()
         with init_context(), warnings.catch_warnings():
             warnings.simplefilter("ignore")
@@ -639,7 +645,7 @@ class CriticWorker(Worker):
             critic_module = AutoModelForTokenClassification.from_pretrained(pretrained_model_name_or_path=local_path,
                                                                             torch_dtype=torch_dtype,
                                                                             config=critic_model_config,
-                                                                            attn_implementation='flash_attention_2',
+                                                                            attn_implementation=attn_implementation,
                                                                             trust_remote_code=trust_remote_code)
 
             # some parameters may not in torch_dtype
@@ -870,6 +876,12 @@ class RewardModelWorker(Worker):
             from verl.models.transformers.monkey_patch import apply_monkey_patch
             apply_monkey_patch(model_config, verbose=True)
 
+        attn_implementation = 'flash_attention_2'
+        try:
+            import flash_attn  # noqa: F401
+        except ImportError:
+            attn_implementation = 'sdpa'
+
         # note that we have to create model in fp32. Otherwise, the optimizer is in bf16, which is incorrect
         init_context = get_init_weight_context_manager(use_meta_tensor=not model_config.tie_word_embeddings)
 
@@ -879,7 +891,7 @@ class RewardModelWorker(Worker):
             reward_module = AutoModelForTokenClassification.from_pretrained(pretrained_model_name_or_path=local_path,
                                                                             config=model_config,
                                                                             torch_dtype=torch.bfloat16,
-                                                                            attn_implementation='flash_attention_2',
+                                                                            attn_implementation=attn_implementation,
                                                                             trust_remote_code=trust_remote_code)
             reward_module.to(torch.bfloat16)
         auto_wrap_policy = get_fsdp_wrap_policy(module=reward_module, config=self.config.model.fsdp_config)
@@ -905,7 +917,6 @@ class RewardModelWorker(Worker):
         torch.cuda.empty_cache()
 
     def _forward_micro_batch(self, micro_batch):
-        from flash_attn.bert_padding import pad_input, unpad_input, index_first_axis, rearrange
         from verl.utils.ulysses import ulysses_pad_and_slice_inputs, gather_outpus_and_unpad
 
         with torch.no_grad(), torch.autocast(device_type='cuda', dtype=torch.bfloat16):
@@ -915,6 +926,10 @@ class RewardModelWorker(Worker):
             position_ids = micro_batch['position_ids']
 
             if self.use_remove_padding:
+                try:
+                    from flash_attn.bert_padding import pad_input, unpad_input, index_first_axis, rearrange
+                except ImportError as exc:
+                    raise ImportError('flash_attn is required when use_remove_padding=True. Install flash-attn or set use_remove_padding=False.') from exc
                 input_ids_rmpad, indices, *_ = unpad_input(input_ids.unsqueeze(-1),
                                                            attention_mask)  # input_ids_rmpad (total_nnz, ...)
                 input_ids_rmpad = input_ids_rmpad.transpose(0, 1)  # (1, total_nnz)
