@@ -31,7 +31,10 @@ from verl.utils.torch_functional import masked_mean
 from verl.utils.ulysses import ulysses_pad_and_slice_inputs, gather_outpus_and_unpad
 from verl.utils.seqlen_balancing import rearrange_micro_batches, get_reverse_idx
 
-from flash_attn.bert_padding import pad_input, unpad_input, rearrange, index_first_axis
+try:
+    from flash_attn.bert_padding import pad_input, unpad_input, rearrange, index_first_axis
+except ImportError:
+    pad_input = unpad_input = rearrange = index_first_axis = None
 
 __all__ = ['DataParallelPPOCritic']
 
@@ -43,6 +46,8 @@ class DataParallelPPOCritic(BasePPOCritic):
         self.critic_module = critic_module
         self.critic_optimizer = critic_optimizer
         self.use_remove_padding = self.config.model.get('use_remove_padding', False)
+        if self.use_remove_padding and unpad_input is None:
+            raise ImportError('flash_attn is required when use_remove_padding=True. Install flash-attn or set use_remove_padding=False.')
         print(f'Critic use_remove_padding={self.use_remove_padding}')
 
         assert self.config.ppo_mini_batch_size % self.config.ppo_micro_batch_size == 0
