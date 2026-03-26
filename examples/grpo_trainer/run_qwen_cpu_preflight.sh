@@ -8,8 +8,8 @@ export CUDA_VISIBLE_DEVICES=""
 
 DEFAULT_MODEL_PATH=./Qwen/Qwen3-1___7B-Base
 MODEL_PATH=${MODEL_PATH:-$DEFAULT_MODEL_PATH}
-TRAIN_FILE=${TRAIN_FILE:-./tests/e2e/arithmetic_sequence/data/train.parquet}
-VAL_FILE=${VAL_FILE:-./tests/e2e/arithmetic_sequence/data/test.parquet}
+TRAIN_FILE=${TRAIN_FILE:-$HOME/data/gsm8k/train.parquet}
+VAL_FILE=${VAL_FILE:-$HOME/data/gsm8k/test.parquet}
 
 if [ -z "${PYTHON_BIN}" ]; then
     if [ -x "./.venv311/Scripts/python.exe" ]; then

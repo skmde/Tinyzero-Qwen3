@@ -17,6 +17,7 @@ The main entry point to run the PPO algorithm
 
 import logging
 import os
+import inspect
 import warnings
 
 import torch
@@ -44,6 +45,24 @@ logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv('VERL_PPO_LOGGING_LEVEL', 'WARN'))
 
 
+def _build_compatible_ddp(module, ddp_cls, device_id, find_unused_parameters, use_static_graph):
+    ddp_kwargs = dict(device_ids=[device_id],
+                      output_device=device_id,
+                      find_unused_parameters=find_unused_parameters)
+    if use_static_graph:
+        ddp_kwargs['static_graph'] = True
+
+    try:
+        module_ddp = ddp_cls(module, **ddp_kwargs)
+    except TypeError:
+        ddp_kwargs.pop('static_graph', None)
+        module_ddp = ddp_cls(module, **ddp_kwargs)
+        if use_static_graph and hasattr(module_ddp, '_set_static_graph'):
+            module_ddp._set_static_graph()
+
+    return module_ddp
+
+
 class ActorRolloutRefWorker(Worker):
     """
     This worker can be instantiated as a standalone actor or a standalone rollout or a standalone reference policy
@@ -53,6 +72,8 @@ class ActorRolloutRefWorker(Worker):
     def __init__(self, config: DictConfig, role: str):
         super().__init__()
         self.config = config
+        self._strategy = self.config.actor.get('strategy', 'fsdp')
+        self._use_fsdp = self._strategy == 'fsdp'
         import torch.distributed
         if not torch.distributed.is_initialized():
             torch.distributed.init_process_group(backend="nccl")
@@ -84,11 +105,11 @@ class ActorRolloutRefWorker(Worker):
         self._is_offload_param = False
         self._is_offload_grad = False
         self._is_offload_optimizer = False
-        if self._is_actor:
+        if self._is_actor and self._use_fsdp:
             self._is_offload_param = self.config.actor.fsdp_config.get('param_offload', False)
             self._is_offload_grad = self.config.actor.fsdp_config.get('grad_offload', False)
             self._is_offload_optimizer = self.config.actor.fsdp_config.get('optimizer_offload', False)
-        elif self._is_ref:
+        elif self._is_ref and self._use_fsdp:
             # TODO: it seems that manual offload is slowly than FSDP offload
             self._is_offload_param = self.config.ref.fsdp_config.get('param_offload', False)
 
@@ -121,6 +142,7 @@ class ActorRolloutRefWorker(Worker):
         from verl.utils.torch_dtypes import PrecisionType
         from transformers import AutoModelForCausalLM, AutoConfig
         from torch.distributed.fsdp import FullyShardedDataParallel as FSDP, ShardingStrategy, MixedPrecision
+        from torch.nn.parallel import DistributedDataParallel as DDP
         from torch import optim
 
         log_gpu_memory_usage('Before init from HF AutoModel', logger=logger)
@@ -203,8 +225,11 @@ class ActorRolloutRefWorker(Worker):
                 except ImportError as exc:
                     raise ImportError('Please install peft to enable LoRA/QLoRA training.') from exc
                 if use_qlora:
-                    actor_module = prepare_model_for_kbit_training(actor_module,
-                                                                   use_gradient_checkpointing=enable_gradient_checkpointing)
+                    prep_kwargs = {'use_gradient_checkpointing': enable_gradient_checkpointing}
+                    if enable_gradient_checkpointing and 'gradient_checkpointing_kwargs' in inspect.signature(
+                            prepare_model_for_kbit_training).parameters:
+                        prep_kwargs['gradient_checkpointing_kwargs'] = {'use_reentrant': False}
+                    actor_module = prepare_model_for_kbit_training(actor_module, **prep_kwargs)
 
                 peft_config = LoraConfig(task_type=TaskType.CAUSAL_LM,
                                          inference_mode=False,
@@ -225,50 +250,60 @@ class ActorRolloutRefWorker(Worker):
 
         log_gpu_memory_usage('After init from HF AutoModel', logger=logger)
 
-        # We wrap FSDP for rollout as well
-        mixed_precision_config = fsdp_config.get('mixed_precision', None)
-        if mixed_precision_config is not None:
-            param_dtype = PrecisionType.to_dtype(mixed_precision_config.get('param_dtype', 'bf16'))
-            reduce_dtype = PrecisionType.to_dtype(mixed_precision_config.get('reduce_dtype', 'fp32'))
-            buffer_dtype = PrecisionType.to_dtype(mixed_precision_config.get('buffer_dtype', 'fp32'))
+        if self._use_fsdp:
+            mixed_precision_config = fsdp_config.get('mixed_precision', None)
+            if mixed_precision_config is not None:
+                param_dtype = PrecisionType.to_dtype(mixed_precision_config.get('param_dtype', 'bf16'))
+                reduce_dtype = PrecisionType.to_dtype(mixed_precision_config.get('reduce_dtype', 'fp32'))
+                buffer_dtype = PrecisionType.to_dtype(mixed_precision_config.get('buffer_dtype', 'fp32'))
+            else:
+                param_dtype = torch.bfloat16
+                reduce_dtype = torch.float32
+                buffer_dtype = torch.float32
+
+            mixed_precision = MixedPrecision(param_dtype=param_dtype, reduce_dtype=reduce_dtype, buffer_dtype=buffer_dtype)
+
+            if self._is_ref:
+                mixed_precision = None
+
+            auto_wrap_policy = get_fsdp_wrap_policy(module=actor_module, config=fsdp_config.get('wrap_policy', None))
+
+            if self._is_rollout and self.config.rollout.name == 'hf':
+                # TODO(zhangchi.usc1992, shengguangming) fix me. Current, auto_wrap_policy causes HFRollout to hang in Gemma
+                auto_wrap_policy = None
+
+            print(f'wrap_policy: {auto_wrap_policy}')
+
+            if auto_wrap_policy is None:
+                sharding_strategy = ShardingStrategy.SHARD_GRAD_OP
+            else:
+                sharding_strategy = ShardingStrategy.FULL_SHARD
+
+            actor_module_fsdp = FSDP(
+                actor_module,
+                param_init_fn=init_fn,
+                use_orig_params=enable_lora,
+                auto_wrap_policy=auto_wrap_policy,
+                device_id=torch.cuda.current_device(),
+                sharding_strategy=sharding_strategy,
+                mixed_precision=mixed_precision,
+                sync_module_states=True,
+                device_mesh=self.device_mesh,
+                forward_prefetch=False)
+
+            log_gpu_memory_usage('After Actor FSDP init', logger=logger)
         else:
-            param_dtype = torch.bfloat16
-            reduce_dtype = torch.float32
-            buffer_dtype = torch.float32
-
-        mixed_precision = MixedPrecision(param_dtype=param_dtype, reduce_dtype=reduce_dtype, buffer_dtype=buffer_dtype)
-
-        if self._is_ref:
-            mixed_precision = None
-
-        auto_wrap_policy = get_fsdp_wrap_policy(module=actor_module, config=fsdp_config.get('wrap_policy', None))
-
-        if self._is_rollout and self.config.rollout.name == 'hf':
-            # TODO(zhangchi.usc1992, shengguangming) fix me. Current, auto_wrap_policy causes HFRollout to hang in Gemma
-            auto_wrap_policy = None
-
-        print(f'wrap_policy: {auto_wrap_policy}')
-
-        # TODO(sgm): support hybrid
-        if auto_wrap_policy is None:
-            sharding_strategy = ShardingStrategy.SHARD_GRAD_OP
-        else:
-            sharding_strategy = ShardingStrategy.FULL_SHARD
-
-        # TODO: add transformer policy
-        actor_module_fsdp = FSDP(
-            actor_module,
-            param_init_fn=init_fn,
-            use_orig_params=enable_lora,
-            auto_wrap_policy=auto_wrap_policy,
-            device_id=torch.cuda.current_device(),
-            sharding_strategy=sharding_strategy,  # zero3
-            mixed_precision=mixed_precision,
-            sync_module_states=True,
-            device_mesh=self.device_mesh,
-            forward_prefetch=False)
-
-        log_gpu_memory_usage('After Actor FSDP init', logger=logger)
+            actor_module = actor_module.to(torch.cuda.current_device())
+            if self._is_actor and optim_config is not None:
+                use_static_graph = enable_gradient_checkpointing
+                actor_module_fsdp = _build_compatible_ddp(module=actor_module,
+                                                          ddp_cls=DDP,
+                                                          device_id=torch.cuda.current_device(),
+                                                          find_unused_parameters=enable_lora and not use_static_graph,
+                                                          use_static_graph=use_static_graph)
+            else:
+                actor_module_fsdp = actor_module
+            log_gpu_memory_usage('After Actor DDP/plain init', logger=logger)
 
         # TODO: add more optimizer args into config
         if self._is_actor:
@@ -311,6 +346,8 @@ class ActorRolloutRefWorker(Worker):
             rollout_sharding_manager = BaseShardingManager()
             # TODO: a sharding manager that do nothing?
         elif self.config.rollout.name == 'vllm':
+            if not self._use_fsdp:
+                raise NotImplementedError('vLLM rollout is only supported with fsdp strategy in this path.')
             from verl.workers.rollout.vllm_rollout import vLLMRollout
             from verl.workers.sharding_manager import FSDPVLLMShardingManager
             log_gpu_memory_usage('Before building vllm rollout', logger=None)
@@ -360,7 +397,8 @@ class ActorRolloutRefWorker(Worker):
                 lora_config=self.config.model.get('lora', None))
 
             # get the original unwrapped module
-            self.actor_module = self.actor_module_fsdp._fsdp_wrapped_module
+            self.actor_module = getattr(self.actor_module_fsdp, '_fsdp_wrapped_module',
+                                        getattr(self.actor_module_fsdp, 'module', self.actor_module_fsdp))
 
             if self._is_offload_param:
                 # param is require during state_dict in sharding manager
@@ -533,15 +571,31 @@ class ActorRolloutRefWorker(Worker):
                                      device_id=torch.cuda.current_device(),
                                      load_grad=self._is_offload_grad)
 
-        # TODO: support DCP and save sharded checkpoints
-        import torch.distributed
-        from torch.distributed.fsdp import FullyShardedDataParallel as FSDP, StateDictType, FullStateDictConfig
-        cfg = FullStateDictConfig(offload_to_cpu=True, rank0_only=True)
-        with FSDP.state_dict_type(self.actor.actor_module, StateDictType.FULL_STATE_DICT, cfg):
-            state_dict = self.actor.actor_module.state_dict()
+        if self._use_fsdp:
+            # TODO: support DCP and save sharded checkpoints
+            import torch.distributed
+            from torch.distributed.fsdp import FullyShardedDataParallel as FSDP, StateDictType, FullStateDictConfig
+            cfg = FullStateDictConfig(offload_to_cpu=True, rank0_only=True)
+            with FSDP.state_dict_type(self.actor.actor_module, StateDictType.FULL_STATE_DICT, cfg):
+                state_dict = self.actor.actor_module.state_dict()
+        else:
+            actor_to_save = getattr(self.actor.actor_module, 'module', self.actor.actor_module)
+            state_dict = actor_to_save.state_dict()
         if self.rank == 0:
             print(f'Saving actor checkpoint to {local_path}')
             os.makedirs(local_path, exist_ok=True)
+            # PEFT expects JSON-serializable values in config when saving.
+            # Hydra can keep list fields (e.g., target_modules) as ListConfig.
+            try:
+                from omegaconf import ListConfig
+                peft_cfg_map = getattr(self.actor_module, 'peft_config', None)
+                if peft_cfg_map is not None:
+                    for _, peft_cfg in peft_cfg_map.items():
+                        target_modules = getattr(peft_cfg, 'target_modules', None)
+                        if isinstance(target_modules, ListConfig):
+                            peft_cfg.target_modules = list(target_modules)
+            except Exception as exc:
+                print(f'Warning: failed to normalize PEFT config before save: {exc}')
             self.actor_module.save_pretrained(local_path, state_dict=state_dict)
             self.tokenizer.save_pretrained(local_path)
             if hdfs_path is not None:
@@ -562,6 +616,8 @@ class CriticWorker(Worker):
         if not torch.distributed.is_initialized():
             torch.distributed.init_process_group(backend="nccl")
         self.config = config
+        self._strategy = self.config.get('strategy', 'fsdp')
+        self._use_fsdp = self._strategy == 'fsdp'
 
         # build device mesh for Ulysses Sequence Parallel
         world_size = torch.distributed.get_world_size()
@@ -577,9 +633,14 @@ class CriticWorker(Worker):
         self.ulysses_sharding_manager = FSDPUlyssesShardingManager(self.ulysses_device_mesh)
 
         # set FSDP offload params
-        self._is_offload_param = self.config.model.fsdp_config.param_offload
-        self._is_offload_grad = self.config.model.fsdp_config.grad_offload
-        self._is_offload_optimizer = self.config.model.fsdp_config.optimizer_offload
+        if self._use_fsdp:
+            self._is_offload_param = self.config.model.fsdp_config.param_offload
+            self._is_offload_grad = self.config.model.fsdp_config.grad_offload
+            self._is_offload_optimizer = self.config.model.fsdp_config.optimizer_offload
+        else:
+            self._is_offload_param = False
+            self._is_offload_grad = False
+            self._is_offload_optimizer = False
 
         # normalize config
         self.config.ppo_mini_batch_size //= (torch.distributed.get_world_size() // self.ulysses_sequence_parallel_size)
@@ -592,6 +653,7 @@ class CriticWorker(Worker):
         from verl.utils.model import LambdaLayer, print_model_size, squeeze
         from verl.utils.torch_dtypes import PrecisionType
         from torch.distributed.fsdp import FullyShardedDataParallel as FSDP, ShardingStrategy, MixedPrecision
+        from torch.nn.parallel import DistributedDataParallel as DDP
         from torch import optim
 
         local_path = copy_local_path_from_hdfs(config.model.path)
@@ -658,34 +720,44 @@ class CriticWorker(Worker):
 
         self.critic_model_config = critic_model_config
 
-        fsdp_config = self.config.model.fsdp_config
-        mixed_precision_config = fsdp_config.get('mixed_precision', None)
-        if mixed_precision_config is not None:
-            param_dtype = PrecisionType.to_dtype(mixed_precision_config.get('param_dtype', 'bf16'))
-            reduce_dtype = PrecisionType.to_dtype(mixed_precision_config.get('reduce_dtype', 'fp32'))
-            buffer_dtype = PrecisionType.to_dtype(mixed_precision_config.get('buffer_dtype', 'fp32'))
+        if self._use_fsdp:
+            fsdp_config = self.config.model.fsdp_config
+            mixed_precision_config = fsdp_config.get('mixed_precision', None)
+            if mixed_precision_config is not None:
+                param_dtype = PrecisionType.to_dtype(mixed_precision_config.get('param_dtype', 'bf16'))
+                reduce_dtype = PrecisionType.to_dtype(mixed_precision_config.get('reduce_dtype', 'fp32'))
+                buffer_dtype = PrecisionType.to_dtype(mixed_precision_config.get('buffer_dtype', 'fp32'))
+            else:
+                param_dtype = torch.bfloat16
+                reduce_dtype = torch.float32
+                buffer_dtype = torch.float32
+
+            mixed_precision = MixedPrecision(param_dtype=param_dtype, reduce_dtype=reduce_dtype, buffer_dtype=buffer_dtype)
+
+            auto_wrap_policy = get_fsdp_wrap_policy(module=critic_module, config=self.config.model.fsdp_config.wrap_policy)
+
+            log_gpu_memory_usage('Before critic FSDP', logger=None)
+
+            critic_module = FSDP(critic_module,
+                                 param_init_fn=init_fn,
+                                 use_orig_params=False,
+                                 auto_wrap_policy=auto_wrap_policy,
+                                 device_id=torch.cuda.current_device(),
+                                 sharding_strategy=ShardingStrategy.FULL_SHARD,
+                                 mixed_precision=mixed_precision,
+                                 sync_module_states=True,
+                                 forward_prefetch=False)
+
+            log_gpu_memory_usage('After critic FSDP', logger=None)
         else:
-            param_dtype = torch.bfloat16
-            reduce_dtype = torch.float32
-            buffer_dtype = torch.float32
-
-        mixed_precision = MixedPrecision(param_dtype=param_dtype, reduce_dtype=reduce_dtype, buffer_dtype=buffer_dtype)
-
-        auto_wrap_policy = get_fsdp_wrap_policy(module=critic_module, config=self.config.model.fsdp_config.wrap_policy)
-
-        log_gpu_memory_usage('Before critic FSDP', logger=None)
-
-        critic_module = FSDP(critic_module,
-                             param_init_fn=init_fn,
-                             use_orig_params=False,
-                             auto_wrap_policy=auto_wrap_policy,
-                             device_id=torch.cuda.current_device(),
-                             sharding_strategy=ShardingStrategy.FULL_SHARD,
-                             mixed_precision=mixed_precision,
-                             sync_module_states=True,
-                             forward_prefetch=False)
-
-        log_gpu_memory_usage('After critic FSDP', logger=None)
+            critic_module = critic_module.to(torch.cuda.current_device())
+            use_static_graph = config.model.get('enable_gradient_checkpointing', False)
+            critic_module = _build_compatible_ddp(module=critic_module,
+                                                  ddp_cls=DDP,
+                                                  device_id=torch.cuda.current_device(),
+                                                  find_unused_parameters=False,
+                                                  use_static_graph=use_static_graph)
+            log_gpu_memory_usage('After critic DDP init', logger=None)
 
         critic_optimizer = optim.AdamW(critic_module.parameters(),
                                        lr=config.optim.lr,
@@ -796,16 +868,21 @@ class CriticWorker(Worker):
                                      device_id=torch.cuda.current_device(),
                                      load_grad=self._is_offload_grad)
 
-        # TODO: support DCP and save sharded checkpoints
-        import torch.distributed
-        from torch.distributed.fsdp import FullyShardedDataParallel as FSDP, StateDictType, FullStateDictConfig
-        cfg = FullStateDictConfig(offload_to_cpu=True, rank0_only=True)
-        with FSDP.state_dict_type(self.critic_module, StateDictType.FULL_STATE_DICT, cfg):
-            state_dict = self.critic_module.state_dict()
+        if self._use_fsdp:
+            # TODO: support DCP and save sharded checkpoints
+            import torch.distributed
+            from torch.distributed.fsdp import FullyShardedDataParallel as FSDP, StateDictType, FullStateDictConfig
+            cfg = FullStateDictConfig(offload_to_cpu=True, rank0_only=True)
+            with FSDP.state_dict_type(self.critic_module, StateDictType.FULL_STATE_DICT, cfg):
+                state_dict = self.critic_module.state_dict()
+            model_to_save = self.critic_module._fsdp_wrapped_module
+        else:
+            model_to_save = getattr(self.critic_module, 'module', self.critic_module)
+            state_dict = model_to_save.state_dict()
         if self.rank == 0:
             print(f'Saving critic checkpoint to {local_path}')
             os.makedirs(local_path, exist_ok=True)
-            self.critic_module._fsdp_wrapped_module.save_pretrained(local_path, state_dict=state_dict)
+            model_to_save.save_pretrained(local_path, state_dict=state_dict)
             self.tokenizer.save_pretrained(local_path)
             if hdfs_path is not None:
                 print(f'Uploading critic checkpoint to {hdfs_path}')

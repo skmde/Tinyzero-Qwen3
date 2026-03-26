@@ -3,6 +3,23 @@ import json
 import os
 
 
+REQUIRED_COLUMNS = ["data_source", "prompt", "ability", "reward_model", "extra_info"]
+
+
+def _validate_schema(df, tag: str) -> None:
+    missing = [c for c in REQUIRED_COLUMNS if c not in df.columns]
+    if missing:
+        raise ValueError(f"{tag} parquet missing columns: {missing}; got={list(df.columns)}")
+
+    sample = df.head(16)
+    invalid = 0
+    for row in sample["reward_model"].tolist():
+        if not isinstance(row, dict) or "ground_truth" not in row:
+            invalid += 1
+    if invalid > 0:
+        raise ValueError(f"{tag} parquet has invalid reward_model rows in sampled data: {invalid}")
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="CPU preflight checks for TinyZero Qwen RL setup")
     parser.add_argument("--model_path", type=str, required=True)
@@ -50,6 +67,8 @@ def main() -> int:
     print(f"val_rows={len(val_df)}")
 
     print("[5/5] Basic schema checks...")
+    _validate_schema(train_df, "train")
+    _validate_schema(val_df, "val")
     print(f"train_columns={list(train_df.columns)}")
     print(f"val_columns={list(val_df.columns)}")
 

@@ -122,7 +122,7 @@ def main_task(config):
     tokenizer = hf_tokenizer(local_path)
 
     # define worker classes
-    if config.actor_rollout_ref.actor.strategy == 'fsdp':
+    if config.actor_rollout_ref.actor.strategy in ['fsdp', 'ddp']:
         assert config.actor_rollout_ref.actor.strategy == config.critic.strategy
         from verl.workers.fsdp_workers import ActorRolloutRefWorker, CriticWorker
         from verl.single_controller.ray import RayWorkerGroup
@@ -162,7 +162,7 @@ def main_task(config):
     # - finally, we combine all the rewards together
     # - The reward type depends on the tag of the data
     if config.reward_model.enable:
-        if config.reward_model.strategy == 'fsdp':
+        if config.reward_model.strategy in ['fsdp', 'ddp']:
             from verl.workers.fsdp_workers import RewardModelWorker
         elif config.reward_model.strategy == 'megatron':
             from verl.workers.megatron_workers import RewardModelWorker

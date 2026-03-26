@@ -22,6 +22,7 @@ import torch.distributed
 from tensordict import TensorDict
 from torch import nn
 from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
+from torch.nn.parallel import DistributedDataParallel as DDP
 
 from verl import DataProto
 from verl.utils.torch_functional import get_eos_mask
@@ -62,10 +63,13 @@ class HFRollout(BaseRollout):
 
         self.module.eval()
         param_ctx = contextlib.nullcontext()
+        module_for_generation = self.module.module if isinstance(self.module, DDP) else self.module
 
         # make sampling args can be overriden by inputs
         do_sample = prompts.meta_info.get('do_sample', self.config.do_sample)
         response_length = prompts.meta_info.get('response_length', self.config.response_length)
+        num_return_sequences = prompts.meta_info.get('n', self.config.get('n', 1))
+        num_return_sequences = max(1, int(num_return_sequences))
         top_p = prompts.meta_info.get('top_p', self.config.get('top_p', 1.0))
         top_k = prompts.meta_info.get('top_k', self.config.get('top_k', 0))
 
@@ -77,15 +81,16 @@ class HFRollout(BaseRollout):
 
         generation_config = GenerationConfig(temperature=temperature, top_p=top_p, top_k=top_k)
 
-        if isinstance(self.module, FSDP):
+        if isinstance(module_for_generation, FSDP):
             # recurse need to set to False according to https://github.com/pytorch/pytorch/issues/100069
-            param_ctx = FSDP.summon_full_params(self.module, writeback=False, recurse=False)
+            param_ctx = FSDP.summon_full_params(module_for_generation, writeback=False, recurse=False)
         with param_ctx:
             with torch.autocast(device_type='cuda', dtype=torch.bfloat16):
-                output = self.module.generate(
+                output = module_for_generation.generate(
                     input_ids=idx,
                     attention_mask=attention_mask,
                     do_sample=do_sample,
+                    num_return_sequences=num_return_sequences,
                     max_new_tokens=response_length,
                     # max_length=max_length,
                     eos_token_id=eos_token_id,
@@ -97,14 +102,15 @@ class HFRollout(BaseRollout):
                     use_cache=True)
         # TODO: filter out the seq with no answers like ds-chat
         seq = output.sequences
+        expanded_batch_size = seq.size(0)
 
         # huggingface generate will stop generating when all the batch reaches [EOS].
         # We have to pad to response_length
-        sequence_length = prompt_length + self.config.response_length
+        sequence_length = prompt_length + response_length
         delta_length = sequence_length - seq.shape[1]
 
         if delta_length > 0:
-            delta_tokens = torch.ones(size=(batch_size, delta_length), device=seq.device, dtype=seq.dtype)
+            delta_tokens = torch.ones(size=(expanded_batch_size, delta_length), device=seq.device, dtype=seq.dtype)
             delta_tokens = pad_token_id * delta_tokens
             seq = torch.cat((seq, delta_tokens), dim=1)
 
@@ -114,8 +120,11 @@ class HFRollout(BaseRollout):
         response = seq[:, prompt_length:]  # (bs, response_length)
 
         response_length = response.size(1)
+        if num_return_sequences > 1:
+            position_ids = position_ids.repeat_interleave(num_return_sequences, dim=0)
+            attention_mask = attention_mask.repeat_interleave(num_return_sequences, dim=0)
         delta_position_id = torch.arange(1, response_length + 1, device=position_ids.device)
-        delta_position_id = delta_position_id.unsqueeze(0).repeat(batch_size, 1)
+        delta_position_id = delta_position_id.unsqueeze(0).repeat(expanded_batch_size, 1)
 
         response_position_ids = position_ids[:, -1:] + delta_position_id
         position_ids = torch.cat([position_ids, response_position_ids], dim=-1)
@@ -131,7 +140,7 @@ class HFRollout(BaseRollout):
                 'attention_mask': attention_mask,
                 'position_ids': position_ids
             },
-            batch_size=batch_size)
+            batch_size=expanded_batch_size)
 
         # empty cache before compute old_log_prob
         torch.cuda.empty_cache()
